@@ -34,16 +34,22 @@ HELP_DETAILS = "\n".join(
 MAX_TOOL_OUTPUT = 4000
 MAX_HISTORY = 12000
 IGNORED_PATH_NAMES = {".git", ".mini-coding-agent", "__pycache__", ".pytest_cache", ".ruff_cache", ".venv", "venv"}
+STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for", "from",
+    "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "should",
+    "that", "the", "this", "to", "use", "with", "you", "your",
+}
 
-##############################
-#### Six Agent Components ####
-##############################
+################################
+#### Seven Agent Components ####
+################################
 # 1) Live Repo Context -> WorkspaceContext
 # 2) Prompt Shape And Cache Reuse -> build_prefix, memory_text, prompt
 # 3) Structured Tools, Validation, And Permissions -> build_tools, run_tool, validate_tool, approve, parse, path, tool_*
 # 4) Context Reduction And Output Management -> clip, history_text
 # 5) Transcripts, Memory, And Resumption -> SessionStore, record, note_tool, ask, reset
 # 6) Delegation And Bounded Subagents -> tool_delegate
+# 7) Agent Skills, Similarity Routing, And Telemetry -> SkillManager, tool_use_skill
 
 
 def now():
@@ -138,6 +144,150 @@ class WorkspaceContext:
             "- project_docs:",
             docs,
         ])
+
+
+######################################################
+#### 7) Agent Skills, Similarity, And Telemetry ######
+######################################################
+class SkillManager:
+    def __init__(self, repo_root, threshold=0.25):
+        self.skills_dir = Path(repo_root) / "skills"
+        self.threshold = threshold
+        self.skills = self.discover()
+
+    def discover(self):
+        discovered = {}
+        if not self.skills_dir.is_dir():
+            return discovered
+
+        for entry in sorted(self.skills_dir.iterdir(), key=lambda p: p.name.lower()):
+            if not entry.is_dir():
+                continue
+            skill_file = entry / "SKILL.md"
+            if not skill_file.is_file():
+                continue
+
+            raw_text = skill_file.read_text(encoding="utf-8", errors="replace")
+            meta, body = self._parse_skill_md(raw_text, default_name=entry.name)
+            name = meta.get("name", entry.name).strip() or entry.name
+            description = meta.get("description", "").strip()
+            if not description:
+                first_line = next((ln.strip("# ").strip() for ln in body.splitlines() if ln.strip()), "")
+                description = first_line or f"Skill instructions for {name}"
+
+            triggers = meta.get("triggers", [])
+            discovered[name] = {
+                "name": name,
+                "path": str(skill_file),
+                "description": description,
+                "triggers": triggers,
+                "body": body.strip(),
+            }
+        return discovered
+
+    @staticmethod
+    def _parse_skill_md(raw_text, default_name):
+        meta = {"name": default_name, "description": "", "triggers": []}
+        body = raw_text
+        if raw_text.startswith("---"):
+            parts = raw_text.split("---", 2)
+            if len(parts) == 3:
+                frontmatter, body = parts[1], parts[2]
+                for line in frontmatter.splitlines():
+                    if ":" not in line:
+                        continue
+                    key, val = line.split(":", 1)
+                    key = key.strip().lower()
+                    val = val.strip().strip('"').strip("'")
+                    if key == "name" and val:
+                        meta["name"] = val
+                    elif key == "description" and val:
+                        meta["description"] = val
+                    elif key == "triggers" and val:
+                        cleaned = val.strip("[]")
+                        meta["triggers"] = [t.strip().strip('"').strip("'") for t in cleaned.split(",") if t.strip()]
+        return meta, body
+
+    @staticmethod
+    def _tokenize(text):
+        raw_tokens = re.findall(r"[a-z0-9_-]+", text.lower())
+        tokens = set()
+        for tok in raw_tokens:
+            if tok not in STOP_WORDS and len(tok) > 1:
+                tokens.add(tok)
+            for part in re.split(r"[_-]+", tok):
+                if part not in STOP_WORDS and len(part) > 1:
+                    tokens.add(part)
+        return tokens
+
+    def score_skill(self, prompt, skill):
+        prompt_lower = prompt.lower()
+        name_lower = skill["name"].lower()
+
+        # Direct skill name or explicit trigger phrase boost
+        if name_lower in prompt_lower or name_lower.replace("-", " ") in prompt_lower:
+            return 1.0
+        for trig in skill["triggers"]:
+            if trig.lower() in prompt_lower:
+                return 1.0
+
+        prompt_tokens = self._tokenize(prompt)
+        if not prompt_tokens:
+            return 0.0
+
+        skill_corpus = " ".join([skill["name"], skill["description"], " ".join(skill["triggers"])])
+        skill_tokens = self._tokenize(skill_corpus)
+        if not skill_tokens:
+            return 0.0
+
+        overlap = prompt_tokens & skill_tokens
+        if not overlap:
+            return 0.0
+
+        # Recall-weighted overlap normalized by prompt intent size and harmonic similarity
+        prompt_coverage = len(overlap) / len(prompt_tokens)
+        jaccard = len(overlap) / len(prompt_tokens | skill_tokens)
+        score = 0.7 * prompt_coverage + 0.3 * jaccard
+        return round(min(score, 1.0), 4)
+
+    def match(self, prompt):
+        scores = {}
+        best_skill = None
+        best_score = -1.0
+
+        for name, skill in self.skills.items():
+            score = self.score_skill(prompt, skill)
+            scores[name] = score
+            if score > best_score:
+                best_score = score
+                best_skill = skill
+
+        triggered = best_skill if (best_skill is not None and best_score >= self.threshold) else None
+        return scores, triggered
+
+    def summary_text(self):
+        if not self.skills:
+            return "- none"
+        lines = []
+        for name, skill in self.skills.items():
+            lines.append(f"- {name}: {skill['description']}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def log_run(prompt, scores, triggered_name, source="similarity"):
+        print("\n" + "=" * 60)
+        print("[SKILL TELEMETRY]")
+        print(f"User Input Prompt : {prompt}")
+        if scores:
+            formatted_scores = ", ".join(f"{k}={v:.4f}" for k, v in scores.items())
+        else:
+            formatted_scores = "(no skills discovered)"
+        print(f"Similarity Scores : {formatted_scores}")
+        if triggered_name:
+            print(f"Triggered Skill   : {triggered_name} (via {source})")
+        else:
+            print("Triggered Skill   : None")
+        print("=" * 60)
 
 
 ##############################
@@ -235,6 +385,7 @@ class MiniAgent:
         depth=0,
         max_depth=1,
         read_only=False,
+        skill_threshold=0.25,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -246,6 +397,8 @@ class MiniAgent:
         self.depth = depth
         self.max_depth = max_depth
         self.read_only = read_only
+        self.skill_manager = SkillManager(self.root, threshold=skill_threshold)
+        self.active_skill = None
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
@@ -299,6 +452,12 @@ class MiniAgent:
                 "description": "Search the workspace with rg or a simple fallback.",
                 "run": self.tool_search,
             },
+            "use_skill": {
+                "schema": {"name": "str"},
+                "risky": False,
+                "description": "Load and activate a specialized SKILL.md workflow by name.",
+                "run": self.tool_use_skill,
+            },
             "run_shell": {
                 "schema": {"command": "str", "timeout": "int=20"},
                 "risky": True,
@@ -341,6 +500,7 @@ class MiniAgent:
             [
                 '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
                 '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
+                '<tool>{"name":"use_skill","args":{"name":"pr-review"}}</tool>',
                 '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
                 '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
                 '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
@@ -358,17 +518,20 @@ class MiniAgent:
             "  <final>your answer</final>",
             "- Never invent tool results.",
             "- Keep answers concise and concrete.",
+            "- If an Available Skill matches the user request and is not already active, call use_skill first.",
+            "- If Active Skill Instructions are present in the prompt, follow them strictly.",
             "- If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.",
             "- Before writing tests for existing code, read the implementation first.",
             "- When writing tests, match the current implementation unless the user explicitly asked you to change the code.",
             "- New files should be complete and runnable, including obvious imports.",
             "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
-            "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
+            "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, use_skill, or delegate with args={}.",
         ])
         return "\n\n".join([
             "You are Mini-Coding-Agent, a small local coding agent running through Ollama.",
             "Rules:\n" + rules,
             "Tools:\n" + tool_text,
+            "Available Skills:\n" + self.skill_manager.summary_text(),
             "Valid response examples:\n" + examples,
             self.workspace.text(),
         ])
@@ -420,12 +583,19 @@ class MiniAgent:
     #### 2) Prompt Shape And Cache Reuse (Continued) #######
     ########################################################
     def prompt(self, user_message):
-        return "\n\n".join([
+        sections = [
             self.prefix,
             self.memory_text(),
+        ]
+        if self.active_skill:
+            sections.append(
+                f"Active Skill Instructions ({self.active_skill['name']}):\n{self.active_skill['body']}"
+            )
+        sections.extend([
             "Transcript:\n" + self.history_text(),
             "Current user request:\n" + user_message,
         ])
+        return "\n\n".join(sections)
 
     ###############################################
     #### 5) Session Memory (Continued) ###########
@@ -443,6 +613,16 @@ class MiniAgent:
         self.remember(memory["notes"], note, 5)
 
     def ask(self, user_message):
+        # Refresh skill discovery and evaluate similarity before execution
+        self.skill_manager.skills = self.skill_manager.discover()
+        scores, matched_skill = self.skill_manager.match(user_message)
+        self.active_skill = matched_skill
+        triggered_name = matched_skill["name"] if matched_skill else None
+        trigger_source = "similarity" if matched_skill else "none"
+
+        if self.depth == 0:
+            self.skill_manager.log_run(user_message, scores, triggered_name, source=trigger_source)
+
         memory = self.session["memory"]
         if not memory["task"]:
             memory["task"] = clip(user_message.strip(), 300)
@@ -462,6 +642,15 @@ class MiniAgent:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 result = self.run_tool(name, args)
+
+                if name == "use_skill" and self.active_skill and self.depth == 0:
+                    self.skill_manager.log_run(
+                        user_message,
+                        scores,
+                        self.active_skill["name"],
+                        source="use_skill_tool",
+                    )
+
                 self.record(
                     {
                         "role": "tool",
@@ -526,6 +715,7 @@ class MiniAgent:
             "list_files": '<tool>{"name":"list_files","args":{"path":"."}}</tool>',
             "read_file": '<tool>{"name":"read_file","args":{"path":"README.md","start":1,"end":80}}</tool>',
             "search": '<tool>{"name":"search","args":{"pattern":"binary_search","path":"."}}</tool>',
+            "use_skill": '<tool>{"name":"use_skill","args":{"name":"pr-review"}}</tool>',
             "run_shell": '<tool>{"name":"run_shell","args":{"command":"uv run --with pytest python -m pytest -q","timeout":20}}</tool>',
             "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
@@ -557,6 +747,15 @@ class MiniAgent:
             if not pattern:
                 raise ValueError("pattern must not be empty")
             self.path(args.get("path", "."))
+            return
+
+        if name == "use_skill":
+            skill_name = str(args.get("name", "")).strip()
+            if not skill_name:
+                raise ValueError("name must not be empty")
+            if skill_name not in self.skill_manager.skills:
+                available = ", ".join(self.skill_manager.skills.keys()) or "none"
+                raise ValueError(f"unknown skill '{skill_name}' (available: {available})")
             return
 
         if name == "run_shell":
@@ -670,7 +869,7 @@ class MiniAgent:
 
         body = match.group("body")
         args = dict(attrs)
-        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path"):
+        for key in ("content", "old_text", "new_text", "command", "task", "pattern", "path", "name"):
             if f"<{key}>" in body:
                 args[key] = MiniAgent.extract_raw(body, key)
 
@@ -717,6 +916,7 @@ class MiniAgent:
     def reset(self):
         self.session["history"] = []
         self.session["memory"] = {"task": "", "files": [], "notes": []}
+        self.active_skill = None
         self.session_store.save(self.session)
 
     def path_is_within_root(self, resolved):
@@ -738,6 +938,12 @@ class MiniAgent:
         if not self.path_is_within_root(resolved):
             raise ValueError(f"path escapes workspace: {raw_path}")
         return resolved
+
+    def tool_use_skill(self, args):
+        skill_name = str(args["name"]).strip()
+        skill = self.skill_manager.skills[skill_name]
+        self.active_skill = skill
+        return f"Activated skill '{skill_name}' from {Path(skill['path']).relative_to(self.root)}:\n{skill['body']}"
 
     def tool_list_files(self, args):
         path = self.path(args.get("path", "."))
@@ -931,6 +1137,7 @@ def build_agent(args):
             approval_policy=args.approval,
             max_steps=args.max_steps,
             max_new_tokens=args.max_new_tokens,
+            skill_threshold=args.skill_threshold,
         )
     return MiniAgent(
         model_client=model,
@@ -939,6 +1146,7 @@ def build_agent(args):
         approval_policy=args.approval,
         max_steps=args.max_steps,
         max_new_tokens=args.max_new_tokens,
+        skill_threshold=args.skill_threshold,
     )
 
 
@@ -963,6 +1171,7 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument("--skill-threshold", type=float, default=0.25, help="Similarity score threshold for auto-triggering skills.")
     return parser
 
 
